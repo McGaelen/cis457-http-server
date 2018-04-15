@@ -9,34 +9,28 @@ import java.util.*;
 class Server {
 
     public static void main(String args[]) {
-        int portNum = Integer.parseInt(args[0]);
-		String docroot = args[1];
-		String logfile = args[2];
+        int portNum = 8080;
+		String docroot = ".";
+		String logfile;
 
-
-//        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-//            System.out.println("running shutdown hook");
-//            Iterator it = Server.userSockets.entrySet().iterator();
-//            while (it.hasNext()) {
-//                Map.Entry pair = (Map.Entry) it.next();
-//                ClientConnection cc = (ClientConnection)pair.getValue();
-//                try {
-//                    Server.writeSocket("!shutdown", cc, new SecureRandom(), crypto);
-//                    cc.sc.close();
-//                } catch (IOException e) {
-//                    System.out.println(e.getMessage());
-//                }
-//            }
-//        }));
+		for (int i = 0; i < args.length; i++) {
+		    if (args[i].equals("-p")) {
+		        portNum = Integer.parseInt(args[i+1]);
+            } else if (args[i].equals("-docroot")) {
+		        docroot = args[i+1];
+            } else if (args[i].equals("-logfile")) {
+		        logfile = args[i+1];
+            }
+        }
 
         SocketChannel sc;
         try {
             ServerSocketChannel c = ServerSocketChannel.open();
-            c.bind(new InetSocketAddress(8080));
+            c.bind(new InetSocketAddress(portNum));
             while (true) {
                 sc = c.accept();
                 System.out.println("client connected");
-                TcpServerThread t = new TcpServerThread(sc);
+                TcpServerThread t = new TcpServerThread(sc, docroot);
                 t.start();
             }
         } catch (IOException e) {
@@ -47,9 +41,11 @@ class Server {
 
 class TcpServerThread extends Thread {
     private SocketChannel sc;
+    private String docroot;
 
-    TcpServerThread(SocketChannel sc) {
+    TcpServerThread(SocketChannel sc, String docroot) {
         this.sc = sc;
+        this.docroot = docroot;
     }
 
     public void run() {
@@ -61,79 +57,95 @@ class TcpServerThread extends Thread {
                 sc.read(cmd);
                 command = new String(cmd.array());
                 if (command.equals("")) {
-                    continue;
+                    sc.close();
+                    return;
                 }
 
-                System.out.println("Got from client: " + command);
+                System.out.println(command);
 
 				HTTPRequest request = parseRequest(command);
 
 				if (!request.opcode.equals("GET")) {
-					continue;
+                    sc.write(ByteBuffer.wrap(HTTPResponse.string501().getBytes()));
+                    sc.close();
+                    return;
 				}
 
 				FileInputStream file;
 				File f;
 				try {
-				 	file = new FileInputStream("." + request.path);
-					f = new File("." + request.path);
+				 	file = new FileInputStream(docroot + request.path);
+					f = new File(docroot + request.path);
 				} catch (IOException e) {
 					// send 404 message
-					System.out.println("404");
-					continue;
+					sc.write(ByteBuffer.wrap(HTTPResponse.string404().getBytes()));
+					sc.close();
+					return;
 				}
 
 				HTTPResponse response = new HTTPResponse();
-				response.statusCode = "200";
-				response.statusMessage = "OK";
-				response.date = gmtDate(new Date());
-				response.lastModified = gmtDate(new Date(f.lastModified()));
-				response.contentType = contentType(request.path);
+				boolean is304Response = false;
 
+                Date lastModified = new Date(f.lastModified());
+                response.lastModified = HTTPResponse.gmtDate(lastModified);
+
+                if (request.ifModifiedSince != null) {
+                    Date ifModifiedSince = new Date(request.ifModifiedSince.substring(5));
+
+                    if (!ifModifiedSince.before(lastModified)) {
+                        is304Response = true;
+                    }
+                }
+
+                if (is304Response) {
+                    response.statusCode = "304";
+                    response.statusMessage = "Not Modified";
+                } else {
+                    response.statusCode = "200";
+                    response.statusMessage = "OK";
+                }
+
+				response.date = HTTPResponse.gmtDate(new Date());
+				response.contentType = HTTPResponse.contentType(request.path);
+
+                String[] split = f.getName().split("\\.");
+                String extension = split[split.length - 1];
+
+                if (extension.equals("html") || extension.equals("txt")) {
+                    response.contentLength = Long.toString(f.length());
+                    if (!is304Response) {
+                        Scanner scanner = new Scanner(f);
+                        response.body = scanner.useDelimiter("\\Z").next();
+                        scanner.close();
+                    } else {
+                        response.body = "";
+                    }
+                    sc.write(ByteBuffer.wrap(response.toString().getBytes()));
+                } else {
+                    response.contentLength = Long.toString(f.length());
+                    response.body = "";
+                    if (!is304Response) {
+                        ByteBuffer b = ByteBuffer.allocate((int) f.length());
+                        file.getChannel().read(b);
+                        b.flip();
+                        ByteBuffer[] bufs = {ByteBuffer.wrap(response.toString().getBytes()), b};
+                        sc.write(bufs);
+                    } else {
+                        sc.write(ByteBuffer.wrap(response.toString().getBytes()));
+                    }
+                }
+
+                System.out.println(request.connection);
+                if (request.connection.equals("keep-alive")) {
+                    System.out.println("closing connection");
+                    sc.close();
+                    return;
+                }
             }
         } catch (IOException e) {
             System.out.println(e.getMessage());
         }
     }
-
-	public String contentType(String filename) {
-		String[] split = filename.split("\\.");
-		String extension = split[split.length - 1];
-
-		if (extension.equals("html")) {
-			return "text/html; charset=utf-8";
-		} else if (extension.equals("txt")) {
-			return "text/plain; charset=utf-8";
-		} else if (extension.equals("jpg")) {
-			return "image/jpeg";
-		} else if (extension.equals("pdf")) {
-			return "application/pdf";
-		} else {
-			return "";
-		}
-	}
-
-	public String gmtDate(Date d) {
-		int day = d.getDay();
-		String dayName;
-		if (day == 0) {
-			dayName = "Sun, ";
-		} else if (day == 1) {
-			dayName = "Mon, ";
-		} else if (day == 2) {
-			dayName = "Tue, ";
-		} else if (day == 3) {
-			dayName = "Wed, ";
-		} else if (day == 4) {
-			dayName = "Thu, ";
-		} else if (day == 5) {
-			dayName = "Fri, ";
-		} else {
-			dayName = "Sat, ";
-		}
-
-		return dayName + d.toGMTString();
-	}
 
 	public HTTPRequest parseRequest(String request) {
 		HTTPRequest requestObj = new HTTPRequest();
@@ -144,13 +156,15 @@ class TcpServerThread extends Thread {
 			if (i == 0) {
 				String[] line1 = lines[0].split(" ");
 				requestObj.opcode = line1[0];
-				requestObj.path = line1[1];
+				if (line1.length > 2) {
+                    requestObj.path = line1[1];
+                }
 			} else {
-				String[] line = lines[i].split(" ");
+				String[] line = lines[i].split(": ");
 
-				if (line[0].equals("if-modified-since:")) {
+				if (line[0].equals("If-Modified-Since")) {
 					requestObj.ifModifiedSince = line[1];
-				} else if (line[0].equals("Connection:")) {
+				} else if (line[0].equals("Connection")) {
 					requestObj.connection = line[1];
 				}
 			}
@@ -160,27 +174,95 @@ class TcpServerThread extends Thread {
 }
 
 class HTTPRequest {
-	public String opcode;
-	public String path;
+	String opcode;
+	String path;
 
-	public String ifModifiedSince;
-	public String connection;
+	String ifModifiedSince;
+	String connection;
 
 	public String toString() {
-		return "request: " + opcode + "  " + path + "  " + ifModifiedSince + "  " + connection;
+		return opcode + "  " + path + "  " + ifModifiedSince + "  " + connection;
 	}
 }
 
 class HTTPResponse {
-	public final String version = "http/1.1";
+    final static String version = "http/1.1";
 
-	public String statusCode;
-	public String statusMessage;
+    String statusCode;
+    String statusMessage;
 
-	public String date;
-	public String lastModified;
-	public String contentType;
-	public String contentLength;
+    String date;
+    String lastModified;
+    String contentType;
+    String contentLength;
 
-	public String body;
+	String body;
+
+    static String contentType(String filename) {
+        String[] split = filename.split("\\.");
+        String extension = split[split.length - 1];
+
+        if (extension.equals("html")) {
+            return "text/html; charset=utf-8";
+        } else if (extension.equals("txt")) {
+            return "text/plain; charset=utf-8";
+        } else if (extension.equals("jpg")) {
+            return "image/jpeg";
+        } else if (extension.equals("pdf")) {
+            return "application/pdf";
+        } else {
+            return "";
+        }
+    }
+
+    static String gmtDate(Date d) {
+        int day = d.getDay();
+        String dayName;
+        if (day == 0) {
+            dayName = "Sun, ";
+        } else if (day == 1) {
+            dayName = "Mon, ";
+        } else if (day == 2) {
+            dayName = "Tue, ";
+        } else if (day == 3) {
+            dayName = "Wed, ";
+        } else if (day == 4) {
+            dayName = "Thu, ";
+        } else if (day == 5) {
+            dayName = "Fri, ";
+        } else {
+            dayName = "Sat, ";
+        }
+
+        return dayName + d.toGMTString();
+    }
+
+	public String toString() {
+	    return version + " " + statusCode + " " + statusMessage + "\n"
+                + "Date: " + date + "\n"
+                + "Last-Modified: " + lastModified + "\n"
+                + "Content-Type: " + contentType + "\n"
+                + "Content-Length: " + contentLength + "\n\n"
+                + body;
+    }
+
+    public static String string404() {
+        String message = "<h1>NOT FOUND!!!!!!!!</h1>";
+        return HTTPResponse.version + " 404 Not Found\n"
+                + "Date: " + gmtDate(new Date()) + "\n"
+                + "Content-Type: text/html; charset=utf-8\n"
+                + "Content-Length: " + (message.length()) + "\n\n"
+                + message;
+    }
+
+    public static String string501() {
+        String message = "<h1>NOT MY JOB!!!!!!!</h1>";
+        return HTTPResponse.version + " 501 Not Implemented\n"
+                + "Date: " + gmtDate(new Date()) + "\n"
+                + "Content-Type: text/html; charset=utf-8\n"
+                + "Content-Length: " + (message.length()) + "\n\n"
+                + message;
+    }
+
+
 }
